@@ -6,10 +6,10 @@ run:
 	go run main.go
 
 build:
-	go build -o $(BINARY_NAME) main.go
+	go build -o bin/$(BINARY_NAME) main.go
 
 install:
-	install -m 755 $(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
+	install -m 755 bin/$(BINARY_NAME) /usr/local/bin/$(BINARY_NAME)
 
 clean:
 	rm -f $(BINARY_NAME)

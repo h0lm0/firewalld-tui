@@ -7,46 +7,59 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
-const zone = "restricted"
+var defaultZone = "restricted"
 
 type model struct {
-	ports       []string
-	cursor      int
-	addingPort  bool
-	inputBuffer string
-	err         error
+	ports      []string
+	cursor     int
+	adding     bool
+	input      string
+	zone       string
+	errMessage string
 }
 
-func initialModel() model {
-	ports, err := listPorts()
-	return model{ports: ports, err: err}
+func getZones() ([]string, error) {
+	out, err := exec.Command("firewall-cmd", "--get-zones").Output()
+	if err != nil {
+		return nil, fmt.Errorf("firewall-cmd --get-zones failed: %w", err)
+	}
+	zones := strings.Fields(strings.TrimSpace(string(out)))
+	return zones, nil
 }
 
-func listPorts() ([]string, error) {
+func isValidZone(zone string, allowed []string) bool {
+	for _, z := range allowed {
+		if z == zone {
+			return true
+		}
+	}
+	return false
+}
+
+func getPorts(zone string) ([]string, error) {
 	out, err := exec.Command("sudo", "firewall-cmd", "--permanent", "--zone="+zone, "--list-ports").Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get ports for zone %s: %w", zone, err)
 	}
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" {
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
 		return []string{}, nil
 	}
-	return strings.Split(trimmed, " "), nil
+	return strings.Split(raw, " "), nil
 }
 
-func addPort(port string) error {
-	cmd := exec.Command("sudo", "firewall-cmd", "--zone="+zone, "--add-port="+port, "--permanent")
+func removePort(zone, port string) error {
+	cmd := exec.Command("sudo", "firewall-cmd", "--zone="+zone, "--remove-port="+port, "--permanent")
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	return exec.Command("sudo", "firewall-cmd", "--reload").Run()
 }
 
-func removePort(port string) error {
-	cmd := exec.Command("sudo", "firewall-cmd", "--zone="+zone, "--remove-port="+port, "--permanent")
+func addPort(zone, port string) error {
+	cmd := exec.Command("sudo", "firewall-cmd", "--zone="+zone, "--add-port="+port, "--permanent")
 	if err := cmd.Run(); err != nil {
 		return err
 	}
@@ -59,58 +72,63 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-
 	case tea.KeyMsg:
 		switch msg.String() {
-
-		case "ctrl+c", "q":
+		case "q", "ctrl+c":
 			return m, tea.Quit
-
+		case "a":
+			m.adding = true
+			m.input = ""
+			m.errMessage = ""
+			return m, nil
+		case "enter":
+			if m.adding {
+				err := addPort(m.zone, m.input)
+				if err != nil {
+					m.errMessage = "Erreur: " + err.Error()
+				} else {
+					m.ports, _ = getPorts(m.zone)
+					m.errMessage = ""
+				}
+				m.adding = false
+				m.input = ""
+			} else if len(m.ports) > 0 {
+				err := removePort(m.zone, m.ports[m.cursor])
+				if err != nil {
+					m.errMessage = "Erreur: " + err.Error()
+				} else {
+					m.ports, _ = getPorts(m.zone)
+					if m.cursor >= len(m.ports) {
+						m.cursor = max(0, len(m.ports)-1)
+					}
+					m.errMessage = ""
+				}
+			}
+			return m, nil
+		case "esc":
+			m.adding = false
+			m.input = ""
+			m.errMessage = ""
+			return m, nil
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-
+			return m, nil
 		case "down", "j":
 			if m.cursor < len(m.ports)-1 {
 				m.cursor++
 			}
-
-		case "enter":
-			if m.addingPort {
-				if strings.TrimSpace(m.inputBuffer) != "" {
-					err := addPort(strings.TrimSpace(m.inputBuffer))
-					m.err = err
-					m.addingPort = false
-					m.inputBuffer = ""
-					m.ports, _ = listPorts()
-				}
-			} else if len(m.ports) > 0 {
-				err := removePort(m.ports[m.cursor])
-				m.err = err
-				m.ports, _ = listPorts()
-				if m.cursor >= len(m.ports) && m.cursor > 0 {
-					m.cursor--
-				}
-			}
-
-		case "a":
-			m.addingPort = true
-			m.inputBuffer = ""
-
-		case "esc":
-			m.addingPort = false
-			m.inputBuffer = ""
-
-		case "backspace":
-			if len(m.inputBuffer) > 0 {
-				m.inputBuffer = m.inputBuffer[:len(m.inputBuffer)-1]
-			}
-
+			return m, nil
 		default:
-			if m.addingPort {
-				m.inputBuffer += msg.String()
+			if m.adding {
+				if msg.Type == tea.KeyRunes {
+					m.input += msg.String()
+				} else if msg.Type == tea.KeyBackspace && len(m.input) > 0 {
+					m.input = m.input[:len(m.input)-1]
+				}
 			}
+			return m, nil
 		}
 	}
 	return m, nil
@@ -119,40 +137,80 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var b strings.Builder
 
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render("firewalld TUI - Zone: " + zone)
-	b.WriteString(title + "\n\n")
+	b.WriteString(fmt.Sprintf("# Ports in zone: %s\n\n", m.zone))
 
-	if m.addingPort {
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("Add new port (e.g., 8080/tcp): ") + m.inputBuffer + "\n")
-		b.WriteString("[Enter] to submit, [Esc] to cancel\n")
-		return b.String()
+	if m.errMessage != "" {
+		b.WriteString("[!] " + m.errMessage + "\n\n")
+	}
+
+	for i, port := range m.ports {
+		cursor := "  "
+		if i == m.cursor {
+			cursor = "→ "
+		}
+		b.WriteString(fmt.Sprintf("%s%s\n", cursor, port))
 	}
 
 	if len(m.ports) == 0 {
 		b.WriteString("No ports configured.\n")
-	} else {
-		for i, port := range m.ports {
-			cursor := "  "
-			if m.cursor == i {
-				cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("➤ ")
-				port = lipgloss.NewStyle().Bold(true).Render(port)
-			}
-			b.WriteString(fmt.Sprintf("%s%s\n", cursor, port))
-		}
-		b.WriteString("\n[↑↓] Navigate  [Enter] Delete  [a] Add  [q] Quit\n")
 	}
 
-	if m.err != nil {
-		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Italic(true)
-		b.WriteString("\nError: " + errStyle.Render(m.err.Error()) + "\n")
+	b.WriteString("\n")
+
+	if m.adding {
+		b.WriteString(fmt.Sprintf("Add port (e.g. 443/tcp): %s\n", m.input))
+		b.WriteString("[Enter = Add, Esc = Cancel]\n")
+	} else {
+		b.WriteString("[a = Add] [Enter = Remove selected] [q = Quit]\n")
 	}
 
 	return b.String()
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func main() {
-	if _, err := tea.NewProgram(initialModel()).Run(); err != nil {
-		fmt.Println("Error running program:", err)
+	zone := defaultZone
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		if strings.HasPrefix(arg, "--zone=") {
+			zone = strings.TrimPrefix(arg, "--zone=")
+		} else {
+			fmt.Println("Usage: firewalld-tui [--zone=<name>]")
+			os.Exit(1)
+		}
+	}
+
+	allowedZones, err := getZones()
+	if err != nil {
+		fmt.Println("Erreur récupération zones:", err)
+		os.Exit(1)
+	}
+
+	if !isValidZone(zone, allowedZones) {
+		fmt.Printf("Zone non valide: %q\nZones disponibles: %s\n", zone, strings.Join(allowedZones, ", "))
+		os.Exit(1)
+	}
+
+	ports, err := getPorts(zone)
+	if err != nil {
+		fmt.Println("Erreur chargement ports:", err)
+		os.Exit(1)
+	}
+
+	m := model{
+		ports: ports,
+		zone:  zone,
+	}
+
+	p := tea.NewProgram(m)
+	if err := p.Start(); err != nil {
+		fmt.Println("Erreur TUI:", err)
 		os.Exit(1)
 	}
 }
